@@ -1,0 +1,36 @@
+# mdqr_decode.py - rebuild files from MDQR codes (works offline, Python 3.8+)
+# 1. Scan every code, paste all the text into one file, e.g. scans.txt
+# 2. Run: python mdqr_decode.py scans.txt
+import sys, os, re, json, zlib, lzma
+A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+def b45(s):
+    o = bytearray()
+    for i in range(0, len(s), 3):
+        v = [A.index(c) for c in s[i:i+3]]
+        n = sum(x * 45**k for k, x in enumerate(v))
+        o += n.to_bytes(2 if len(v) == 3 else 1, "big")
+    return bytes(o)
+src = sys.argv[1] if len(sys.argv) > 1 else "scans.txt"
+txt = open(src, encoding="utf-8").read()
+sets = {}
+for m in re.finditer(r"MQ:([BX]):([0-9A-F]{8}):(\d+)/(\d+):(\d+):", txt):
+    k, crc, i, n, ln = m.groups(); ln = int(ln)
+    d = re.split(r"[\r\n]", txt[m.end():m.end() + ln])[0].ljust(ln)
+    sets.setdefault((k, crc, int(n)), {})[int(i)] = d
+if not sets: sys.exit("No MDQR codes found in " + src)
+for (k, crc, n), parts in sets.items():
+    miss = [i for i in range(1, n + 1) if i not in parts]
+    if miss: print(f"Batch {crc}: missing part(s) {miss} of {n}"); continue
+    data = b45("".join(parts[i] for i in range(1, n + 1)))
+    if f"{zlib.crc32(data):08X}" != crc: print(f"Batch {crc}: damaged, rescan it"); continue
+    if k == "B":
+        try: import brotli
+        except ImportError: sys.exit("Run: pip install brotli   then try again")
+        raw = brotli.decompress(data)
+    else:
+        raw = lzma.decompress(data, lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9}])
+    for path, text in json.loads(raw).items():
+        p = os.path.normpath(path)
+        if os.path.isabs(p) or p.startswith(".."): print("Skipped unsafe path", path); continue
+        p = os.path.join("mdqr_files", p); os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(text.encode("utf-8")); print("Restored", p)
