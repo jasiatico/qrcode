@@ -85,10 +85,12 @@ def gather(paths):
 
 def split(payload: str, method: str, crc: str, version: int):
     cap = ALNUM_L[version - 1]
-    # Header worst case, e.g. "MQ:B:1A2B3C4D:999/999:9999:" (sized after a first pass).
+    # Header e.g. "MDQR PART 3/16 B 1A2B3C4D 1830 ". It must NOT start with
+    # "letters:" or iPhones treat the code as a link with an unknown scheme
+    # and report "No usable data found".
     n = 1
     while True:
-        header_len = len(f"MQ:{method}:{crc}:{n}/{n}:{cap}:")
+        header_len = len(f"MDQR PART {n}/{n} {method} {crc} {cap} ")
         size = cap - header_len
         need = -(-len(payload) // size)
         if need <= n:
@@ -96,7 +98,7 @@ def split(payload: str, method: str, crc: str, version: int):
         n = need
     chunks = [payload[i:i + size] for i in range(0, len(payload), size)]
     total = len(chunks)
-    return [f"MQ:{method}:{crc}:{i}/{total}:{len(c)}:{c}" for i, c in enumerate(chunks, 1)]
+    return [f"MDQR PART {i}/{total} {method} {crc} {len(c)} {c}" for i, c in enumerate(chunks, 1)]
 
 
 def make_qr(text: str, mode, max_version=40):
@@ -188,11 +190,13 @@ def main():
         decoder = (HERE / "mdqr_decode.py").read_text(encoding="utf-8")
         qr = make_qr(decoder, MODE_8BIT_BYTE)
         save_image(qr, args.out, "part_00_decoder", "Decoder: save as mdqr_decode.py")
-        slides.append(("Decoder", "Scan, copy the text, save it as mdqr_decode.py", svg_string(qr)))
+        slides.append(("Decoder", "Copy the text and save it as mdqr_decode.py · "
+                       "iPhone: use Code Scanner, not Camera", svg_string(qr)))
     for i, text in enumerate(parts, 1):
         qr = make_qr(text, MODE_ALPHA_NUM, version)
         save_image(qr, args.out, f"part_{i:02d}", f"Part {i} of {total}")
-        slides.append((f"Part {i} of {total}", "Scan and paste into your notes", svg_string(qr)))
+        slides.append((f"Part {i} of {total}", "Copy the text into one note · "
+                       "iPhone: use Code Scanner, not Camera", svg_string(qr)))
 
     algo = {"B": "Brotli", "X": "LZMA"}[method]
     lines = sum(len(t.splitlines()) for t in bundle.values())
