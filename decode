@@ -1,270 +1,36 @@
-#!/usr/bin/env python3
-"""
-mdqr_encode.py: pack Markdown files into a set of numbered QR codes (fully offline).
-
-    python mdqr_encode.py notes.md guide.md             # specific files
-    python mdqr_encode.py my_folder/                    # every .md in a folder
-    python mdqr_encode.py my_folder/ --density max      # fewest codes, densest
-
-How it squeezes the most in:
-  1. All files are bundled into one blob (so they compress together).
-  2. Compressed with Brotli or LZMA, whichever needs fewer codes.
-  3. Encoded as Base45, which fits QR "alphanumeric" mode, about 23% denser
-     than Base64 and safe to copy/paste as text from a phone.
-  4. Split into numbered parts with a checksum, so parts can be scanned in any
-     order and damage is detected.
-
-Output (in ./qr_output by default):
-  viewer.html      open offline in a browser: shows codes one by one, full screen,
-                   or prints them all on a sheet
-  part_00_decoder  the unpacking script itself, as a QR code (byte mode)
-  part_01..NN      the data codes (PNG with labels if Pillow is installed, else SVG)
-
-Setup:  pip install qrcode pillow brotli      (pillow and brotli are optional)
-"""
-
-import argparse
-import html
-import io
-import json
-import lzma
-import sys
-import zlib
-from pathlib import Path
-
-import qrcode
-from qrcode.image.svg import SvgPathImage
-from qrcode.util import QRData, MODE_ALPHA_NUM, MODE_8BIT_BYTE
-
-try:
-    import brotli
-except ImportError:
-    brotli = None
-
-HERE = Path(__file__).resolve().parent
-B45 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
-
-# Alphanumeric characters that fit at error-correction level L, versions 1-40.
-ALNUM_L = [25, 47, 77, 114, 154, 195, 224, 279, 335, 395, 468, 535, 619, 667, 758,
-           854, 938, 1046, 1153, 1249, 1352, 1460, 1588, 1704, 1853, 1990, 2132,
-           2223, 2369, 2520, 2677, 2840, 3009, 3183, 3351, 3537, 3729, 3927, 4087, 4296]
-DENSITY = {"easy": 20, "normal": 25, "dense": 30, "max": 40}   # QR version
-
-
-def b45encode(data: bytes) -> str:
-    out = []
-    for i in range(0, len(data), 2):
-        chunk = data[i:i + 2]
-        n = int.from_bytes(chunk, "big")
-        digits = 3 if len(chunk) == 2 else 2
-        for _ in range(digits):
-            out.append(B45[n % 45])
-            n //= 45
-    return "".join(out)
-
-
-def gather(paths):
-    files = []
-    for p in map(Path, paths):
-        if p.is_dir():
-            files += [(f, f.relative_to(p)) for f in sorted(p.rglob("*.md"))]
-        elif p.is_file():
-            files.append((p, Path(p.name)))
-        else:
-            sys.exit(f"Not found: {p}")
-    if not files:
-        sys.exit("No .md files found.")
-    bundle = {}
-    for f, rel in files:
-        try:
-            bundle[rel.as_posix()] = f.read_bytes().decode("utf-8")
-        except UnicodeDecodeError:
-            sys.exit(f"{f} is not UTF-8 text.")
-    return bundle
-
-
-def split(payload: str, method: str, crc: str, version: int):
-    cap = ALNUM_L[version - 1]
-    # Header e.g. "MDQR PART 3/16 B 1A2B3C4D 1830 ". It must NOT start with
-    # "letters:" or iPhones treat the code as a link with an unknown scheme
-    # and report "No usable data found".
-    n = 1
-    while True:
-        header_len = len(f"MDQR PART {n}/{n} {method} {crc} {cap} ")
-        size = cap - header_len
-        need = -(-len(payload) // size)
-        if need <= n:
-            break
-        n = need
-    chunks = [payload[i:i + size] for i in range(0, len(payload), size)]
-    total = len(chunks)
-    return [f"MDQR PART {i}/{total} {method} {crc} {len(c)} {c}" for i, c in enumerate(chunks, 1)]
-
-
-def make_qr(text: str, mode, max_version=40):
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=4, box_size=8)
-    qr.add_data(QRData(text.encode("utf-8") if mode == MODE_8BIT_BYTE else text, mode=mode))
-    qr.make(fit=True)
-    if qr.version > max_version:
-        raise RuntimeError(f"Code needed version {qr.version}, expected ≤ {max_version}")
-    return qr
-
-
-def save_image(qr, out_dir: Path, stem: str, label: str) -> Path:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError:
-        path = out_dir / f"{stem}.svg"
-        qr.make_image(image_factory=SvgPathImage).save(path)
-        return path
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    pad = 70
-    canvas = Image.new("RGB", (img.width, img.height + pad), "white")
-    canvas.paste(img, (0, 0))
-    draw = ImageDraw.Draw(canvas)
-    try:
-        font = ImageFont.load_default(size=36)
-    except TypeError:            # Pillow < 10.1
-        font = ImageFont.load_default()
-    w = draw.textlength(label, font=font)
-    draw.text(((img.width - w) / 2, img.height - 10), label, fill="black", font=font)
-    path = out_dir / f"{stem}.png"
-    canvas.save(path)
-    return path
-
-
-def svg_string(qr) -> str:
-    buf = io.BytesIO()
-    qr.make_image(image_factory=SvgPathImage).save(buf)
-    s = buf.getvalue().decode("utf-8")
-    return s[s.index("<svg"):]
-
-
-def write_viewer(out_dir: Path, slides, summary: str):
-    items = "\n".join(
-        f'<figure class="slide" data-i="{i}"><div class="qr">{svg}</div>'
-        f'<figcaption><strong>{html.escape(title)}</strong><span>{html.escape(sub)}</span></figcaption></figure>'
-        for i, (title, sub, svg) in enumerate(slides))
-    page = VIEWER.replace("{{SLIDES}}", items).replace("{{SUMMARY}}", html.escape(summary)) \
-                 .replace("{{COUNT}}", str(len(slides)))
-    (out_dir / "viewer.html").write_text(page, encoding="utf-8")
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Pack Markdown files into numbered QR codes.")
-    ap.add_argument("inputs", nargs="+", help=".md files and/or folders")
-    ap.add_argument("--density", choices=DENSITY, default="normal",
-                    help="easy=more, smaller codes; max=fewest, densest codes (default: normal)")
-    ap.add_argument("--stdlib", action="store_true",
-                    help="use LZMA only, so recipients don't need 'pip install brotli'")
-    ap.add_argument("--no-decoder", action="store_true", help="don't include the decoder QR code")
-    ap.add_argument("-o", "--out", type=Path, default=Path("qr_output"))
-    args = ap.parse_args()
-
-    bundle = gather(args.inputs)
-    raw = json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    version = DENSITY[args.density]
-
-    candidates = {"X": lzma.compress(raw, format=lzma.FORMAT_RAW, filters=[
-        {"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME}])}
-    if brotli and not args.stdlib:
-        candidates["B"] = brotli.compress(raw, quality=11, lgwin=24)
-
-    plans = {}
-    for method, blob in candidates.items():
-        crc = f"{zlib.crc32(blob):08X}"
-        plans[method] = (blob, split(b45encode(blob), method, crc, version))
-    # Brotli only if it actually saves a code (it makes recipients install a module).
-    method = "X"
-    if "B" in plans and len(plans["B"][1]) < len(plans["X"][1]):
-        method = "B"
-    blob, parts = plans[method]
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    for old in args.out.glob("part_*"):
-        old.unlink()
-
-    slides = []
-    total = len(parts)
-    if not args.no_decoder:
-        decoder = (HERE / "mdqr_decode.py").read_text(encoding="utf-8")
-        qr = make_qr(decoder, MODE_8BIT_BYTE)
-        save_image(qr, args.out, "part_00_decoder", "Decoder: save as mdqr_decode.py")
-        slides.append(("Decoder", "Copy the text and save it as mdqr_decode.py · "
-                       "iPhone: use Code Scanner, not Camera", svg_string(qr)))
-    for i, text in enumerate(parts, 1):
-        qr = make_qr(text, MODE_ALPHA_NUM, version)
-        save_image(qr, args.out, f"part_{i:02d}", f"Part {i} of {total}")
-        slides.append((f"Part {i} of {total}", "Copy the text into one note · "
-                       "iPhone: use Code Scanner, not Camera", svg_string(qr)))
-
-    algo = {"B": "Brotli", "X": "LZMA"}[method]
-    lines = sum(len(t.splitlines()) for t in bundle.values())
-    summary = (f"{len(bundle)} file(s), {lines:,} lines, {len(raw):,} bytes → "
-               f"{len(blob):,} bytes with {algo} ({len(raw) / len(blob):.1f}x) → {total} data code(s)")
-    write_viewer(args.out, slides, summary)
-
-    print(summary)
-    if method == "B":
-        print("Note: uses Brotli, so recipients need 'pip install brotli' "
-              "(use --stdlib to avoid that).")
-    print(f"Open {args.out / 'viewer.html'} to show or print the codes.")
-
-
-VIEWER = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>QR Bundle</title>
-<style>
-:root{--bg:#f6f5f2;--fg:#1d1d1b;--muted:#6b6a66;--card:#fff;--line:#e2e0da;--accent:#2f5d50}
-@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#eceae4;--muted:#9a988f;--card:#222220;--line:#34332f;--accent:#7fb7a6}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
-     min-height:100vh;display:flex;flex-direction:column}
-header{padding:16px 20px;display:flex;gap:12px;align-items:baseline;justify-content:space-between;flex-wrap:wrap;
-       border-bottom:1px solid var(--line)}
-h1{font-size:18px;margin:0}
-header p{margin:0;color:var(--muted);font-size:14px}
-main{flex:1;display:flex;align-items:center;justify-content:center;padding:16px}
-.slide{display:none;margin:0;text-align:center}
-.slide.on{display:block}
-.qr{background:#fff;padding:12px;border-radius:12px;display:inline-block;line-height:0}
-.qr svg{width:min(62vh,88vw);height:auto;display:block}
-figcaption{margin-top:14px;display:flex;flex-direction:column;gap:2px}
-figcaption strong{font-size:26px}
-figcaption span{color:var(--muted)}
-nav{display:flex;gap:10px;justify-content:center;align-items:center;padding:12px 16px 20px}
-button{font:inherit;padding:10px 18px;border-radius:10px;border:1px solid var(--line);background:var(--card);
-       color:var(--fg);cursor:pointer}
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--bg)}
-#pos{color:var(--muted);min-width:70px;text-align:center;font-variant-numeric:tabular-nums}
-@media print{
-  header p,nav{display:none} body{background:#fff;color:#000} header{border:0}
-  main{display:grid;grid-template-columns:repeat(2,1fr);gap:24px;align-items:start}
-  .slide{display:block;width:100%;break-inside:avoid} .qr{display:block} .qr svg{width:100%}
-  figcaption span{color:#444}
-}
-</style></head><body>
-<header><h1>QR Bundle</h1><p>{{SUMMARY}}</p></header>
-<main>
-{{SLIDES}}
-</main>
-<nav>
-  <button id="prev" aria-label="Previous code">← Prev</button>
-  <button id="next" class="primary" aria-label="Next code">Next →</button>
-  <button id="full">Full screen</button>
-  <button onclick="print()">Print all</button>
-</nav>
-<script>
-const s=[...document.querySelectorAll('.slide')];let i=0;
-function show(n){i=(n+s.length)%s.length;s.forEach((e,k)=>e.classList.toggle('on',k===i));}
-document.getElementById('prev').onclick=()=>show(i-1);
-document.getElementById('next').onclick=()=>show(i+1);
-document.getElementById('full').onclick=()=>{try{document.documentElement.requestFullscreen()}catch(e){}};
-document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' ')show(i+1);if(e.key==='ArrowLeft')show(i-1)});
-show(0);
-</script></body></html>
-"""
-
-if __name__ == "__main__":
-    main()
+# mdqr_decode.py - rebuild files from MDQR codes (works offline, Python 3.8+)
+# 1. Scan every code, paste all the text into one file, e.g. scans.txt
+# 2. Run: python mdqr_decode.py scans.txt
+import sys, os, re, json, zlib, lzma
+A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+def b45(s):
+    o = bytearray()
+    for i in range(0, len(s), 3):
+        v = [A.index(c) for c in s[i:i+3]]
+        n = sum(x * 45**k for k, x in enumerate(v))
+        o += n.to_bytes(2 if len(v) == 3 else 1, "big")
+    return bytes(o)
+src = sys.argv[1] if len(sys.argv) > 1 else "scans.txt"
+txt = open(src, encoding="utf-8").read()
+sets = {}
+for m in re.finditer(r"MDQR PART (\d+)/(\d+) ([BX]) ([0-9A-F]{8}) (\d+) ", txt):
+    i, n, k, crc, ln = m.groups(); ln = int(ln)
+    d = re.split(r"[\r\n]", txt[m.end():m.end() + ln])[0].ljust(ln)
+    sets.setdefault((k, crc, int(n)), {})[int(i)] = d
+if not sets: sys.exit("No MDQR codes found in " + src)
+for (k, crc, n), parts in sets.items():
+    miss = [i for i in range(1, n + 1) if i not in parts]
+    if miss: print(f"Batch {crc}: missing part(s) {miss} of {n}"); continue
+    data = b45("".join(parts[i] for i in range(1, n + 1)))
+    if f"{zlib.crc32(data):08X}" != crc: print(f"Batch {crc}: damaged, rescan it"); continue
+    if k == "B":
+        try: import brotli
+        except ImportError: sys.exit("Run: pip install brotli   then try again")
+        raw = brotli.decompress(data)
+    else:
+        raw = lzma.decompress(data, lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9}])
+    for path, text in json.loads(raw).items():
+        p = os.path.normpath(path)
+        if os.path.isabs(p) or p.startswith(".."): print("Skipped unsafe path", path); continue
+        p = os.path.join("mdqr_files", p); os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(text.encode("utf-8")); print("Restored", p)
